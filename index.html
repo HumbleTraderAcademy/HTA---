@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<meta name="theme-color" content="#000000" />
+<title>HUMBLE TRADER ACADEMY · 永續合約數據</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>html,body{background:#000;margin:0}*{-webkit-tap-highlight-color:transparent}::-webkit-scrollbar{display:none}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}</style>
+</head>
+<body>
+<div id="app" class="min-h-screen bg-black text-neutral-200 max-w-md mx-auto"></div>
+<script>
+// ============================================================
+// HUMBLE TRADER ACADEMY — 永續合約數據網站（正式獨立版 v3）
+// 幣安 USDT-M Futures 公開 API + 強平 WebSocket
+// 新增：時間框架切換(15m/1h/4h)、異常警報專區
+// ============================================================
+const API = "https://fapi.binance.com", WS = "wss://fstream.binance.com/ws";
+const GREEN = "#4ade80", RED = "#f87171", GREY = "#262626", NEU = "#e5e5e5";
+const PERIODS = [["15m", "15分"], ["1h", "1時"], ["4h", "4時"]];
+
+const state = {
+  coins: null, query: "", sort: "vol", period: "1h", view: "market",
+  selected: null, data: null, live: null, tab: "long", expanded: null, updatedAt: null,
+  liq: [], liqStatus: null,
+  alerts: [], alertStatus: null, alertProg: 0,
+};
+const cache = {}, inflight = new Set(), throttles = {};
+let refreshTimer = null, liqWS = null;
+
+function throttle(k, fn, ms = 500) { const n = Date.now(); if (n - (throttles[k] || 0) < ms) return; throttles[k] = n; fn(); }
+async function bfetch(path, ms = 9000) {
+  const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), ms);
+  try { const r = await fetch(API + path, { signal: ctrl.signal }); if (!r.ok) throw new Error("HTTP " + r.status); return await r.json(); }
+  finally { clearTimeout(t); }
+}
+async function pool(items, n, fn) { const q = items.slice(); await Promise.all(Array.from({ length: n }, async () => { while (q.length) await fn(q.shift()); })); }
+
+// ---------- 抓單一幣種指標（依 period） ----------
+async function fetchIndicators(symbol, ticker, period) {
+  const [kl, oiHist, prem, ls, taker, top] = await Promise.all([
+    bfetch(`/fapi/v1/klines?symbol=${symbol}&interval=${period}&limit=13`),
+    bfetch(`/futures/data/openInterestHist?symbol=${symbol}&period=${period}&limit=13`),
+    bfetch(`/fapi/v1/premiumIndex?symbol=${symbol}`),
+    bfetch(`/futures/data/globalLongShortAccountRatio?symbol=${symbol}&period=${period}&limit=1`),
+    bfetch(`/futures/data/takerlongshortRatio?symbol=${symbol}&period=${period}&limit=6`),
+    bfetch(`/futures/data/topLongShortPositionRatio?symbol=${symbol}&period=${period}&limit=1`).catch(() => []),
+  ]);
+  const c0 = parseFloat(kl[0]?.[4]), cL = parseFloat(kl[kl.length - 1]?.[4]);
+  const oiArr = oiHist.map(x => parseFloat(x.sumOpenInterest));
+  const oiFirst = oiArr[0], oiLast = oiArr[oiArr.length - 1], oiPrev = oiArr[Math.max(0, oiArr.length - 4)];
+  const takerAvg = taker.reduce((a, x) => a + parseFloat(x.buySellRatio), 0) / (taker.length || 1);
+  return {
+    price: ticker.price, chg24h: ticker.changePct,
+    priceChangePct: c0 ? ((cL - c0) / c0) * 100 : 0,
+    oiChangePct: oiFirst ? ((oiLast - oiFirst) / oiFirst) * 100 : 0,
+    oiFastPct: oiPrev ? ((oiLast - oiPrev) / oiPrev) * 100 : 0,
+    fundingRate: parseFloat(prem.lastFundingRate), nextFunding: parseFloat(prem.nextFundingTime),
+    lsRatio: parseFloat(ls[0]?.longShortRatio ?? 1),
+    takerRatio: takerAvg, topRatio: parseFloat(top[0]?.longShortRatio ?? NaN),
+    period, demo: false,
+  };
+}
+
+// ============================================================ 加權評分
+function scoreCoin(d) {
+  const pc = d.priceChangePct, oi = d.oiChangePct, fr = d.fundingRate * 100, ls = d.lsRatio, tk = d.takerRatio, sm = d.topRatio;
+  const s = (n, dd = 2) => (n >= 0 ? "+" : "") + n.toFixed(dd);
+  const longChecks = [
+    { pts:3, ok: pc>0&&oi>1, label:"價漲 + OI 增 同步", meaning:"OI 增加代表新資金進場開倉。價漲同時 OI 增，代表漲勢由新開多單真金白銀推動，屬主力建倉、延續機率高；價漲但 OI 不增多半是空頭回補或現貨換手。", now:(pc>0&&oi>1)?`本週期價格 ${s(pc)}%、OI ${s(oi)}% 同步向上——有新資金開多推動，有效多頭結構，權重最高。`:pc>0?`本週期價格 ${s(pc)}% 上漲但 OI 僅 ${s(oi)}%，未見新資金進場，延續性存疑，不給分。`:`本週期價格 ${s(pc)}% 非上漲，不構成條件。` },
+    { pts:2, ok: tk>1.05, label:"主動買盤佔優（CVD 上升）", meaning:"Taker 買賣比＝主動市價買量÷賣量，等同 CVD 方向。>1 代表買方直接吃掉賣單追價，是多方主動攻擊的證據。", now: tk>1.05?`本週期 Taker 買賣比 ${tk.toFixed(3)}，買方持續主動吃單，CVD 上升，多方主導。`:`Taker 買賣比 ${tk.toFixed(3)} 未達 1.05，多方缺乏攻擊力道，不加分。` },
+    { pts:2, ok: !isNaN(sm)&&sm>=1.05&&sm>ls, label:"聰明錢偏多（大戶領先散戶）", meaning:"大戶持倉多空比＝幣安持倉排前段交易者（聰明錢），對照全體帳戶散戶多空比。大戶淨多且比散戶更偏多＝聰明錢偏多；散戶反向更是主力吸籌背離訊號。", now: isNaN(sm)?`無大戶持倉數據，不加分。`:(sm>=1.05&&sm>ls)?`大戶多空比 ${sm.toFixed(2)} 高於散戶 ${ls.toFixed(2)} 且淨多——聰明錢偏多${ls<1?`，散戶偏空，屬強力背離偏多訊號。`:`。`}`:(sm<1.05?`大戶多空比 ${sm.toFixed(2)} 未達淨多門檻，不加分。`:`大戶多空比 ${sm.toFixed(2)} 未高於散戶，不加分。`) },
+    { pts:1, ok: !(pc>0&&tk<0.97), label:"無 CVD 看跌背離", meaning:"價漲但主動買盤縮手（CVD 不升反降），常是衰竭或高位吸收出貨的反轉警訊。此項檢查沒有出現這種結構。", now:(pc>0&&tk<0.97)?`警訊：本週期價漲但 Taker 比僅 ${tk.toFixed(3)}，買盤縮手，看跌背離，追多風險高。`:pc>0?`價漲且 Taker 比 ${tk.toFixed(3)} 配合，未見看跌背離。`:`價格未上漲，照常給分。` },
+    { pts:1, ok: fr<0.05, label:"資金費率未過熱", meaning:"資費為正＝多頭付費，越高越擁擠。超過 +0.05% 視為過熱，是主力反向收割的環境。", now: fr<0.05?`資費 ${s(fr,4)}%，低於 +0.05%，擁擠度可接受。`:`資費 ${s(fr,4)}% 超過 +0.05%，多頭過熱，不加分。` },
+    { pts:1, ok: fr<-0.01, label:"資金費率偏負（軋空燃料）", meaning:"費率為負＝空頭付費、空單擁擠。反彈時空單回補（軋空）會加速上漲。", now: fr<-0.01?`資費 ${s(fr,4)}% 為負，空頭付費，具軋空燃料。`:`資費 ${s(fr,4)}% 未明顯偏負，暫無軋空條件。` },
+    { pts:1, ok: ls<1.5, label:"散戶未擠在多方", meaning:"多空比＝散戶做多÷做空。擠多方時下方止損密集，主力有動機向下收割。", now: ls<1.5?`多空比 ${ls.toFixed(2)} 未達 1.5，未一面倒偏多。`:`多空比 ${ls.toFixed(2)} 超過 1.5，散戶擠多方，成收割對象。` },
+    { pts:1, ok: ls<0.8, label:"散戶極度偏空（反向）", meaning:"多空比 <0.8＝散戶大量看空，上方止損密集＝主力向上收割目標，短線反而偏多。", now: ls<0.8?`多空比 ${ls.toFixed(2)} 低於 0.8，反向偏多成立。`:`多空比 ${ls.toFixed(2)}，未極端偏空，未觸發。` },
+  ];
+  const shortChecks = [
+    { pts:3, ok: pc<0&&oi>1, label:"價跌 + OI 增 同步", meaning:"價跌同時 OI 增，代表跌勢由新開空單主動推動，主力做空布局；價跌但 OI 降屬清槓桿踩踏，跌完易反彈。", now:(pc<0&&oi>1)?`本週期價格 ${s(pc)}%、OI ${s(oi)}%——邊跌邊開空，空方主導，權重最高。`:pc<0?`本週期價格 ${s(pc)}% 下跌但 OI ${s(oi)}% 未見空單加碼，追空易接反彈，不給分。`:`本週期價格 ${s(pc)}% 非下跌，不構成條件。` },
+    { pts:2, ok: tk<0.95, label:"主動賣盤佔優（CVD 下降）", meaning:"Taker 買賣比 <1＝市價賣量大於買量，賣方主動砸穿買單，等同 CVD 下降。", now: tk<0.95?`本週期 Taker 買賣比 ${tk.toFixed(3)}，賣壓壓過買盤，CVD 走低，空方主導。`:`Taker 買賣比 ${tk.toFixed(3)} 未低於 0.95，賣壓不明確，不加分。` },
+    { pts:2, ok: !isNaN(sm)&&sm<=0.95&&sm<ls, label:"聰明錢偏空（大戶低於散戶）", meaning:"大戶淨空且比散戶更偏空＝聰明錢偏空；散戶反向偏多更是主力出貨背離訊號。", now: isNaN(sm)?`無大戶持倉數據，不加分。`:(sm<=0.95&&sm<ls)?`大戶多空比 ${sm.toFixed(2)} 低於散戶 ${ls.toFixed(2)} 且淨空——聰明錢偏空${ls>1?`，散戶偏多，屬強力背離偏空訊號。`:`。`}`:(sm>0.95?`大戶多空比 ${sm.toFixed(2)} 未達淨空門檻，不加分。`:`大戶多空比 ${sm.toFixed(2)} 未低於散戶，不加分。`) },
+    { pts:1, ok: !(pc<0&&tk>1.03), label:"無 CVD 看漲背離", meaning:"價跌但主動買盤偏強（CVD 不跌反升），可能誘空吸籌或賣壓衰竭，追空易被反轉。此項檢查沒有出現這種結構。", now:(pc<0&&tk>1.03)?`警訊：本週期價跌但 Taker 比 ${tk.toFixed(3)}，買方承接，看漲背離，追空風險高。`:pc<0?`價跌且 Taker 比 ${tk.toFixed(3)} 偏空，未見看漲背離。`:`價格未下跌，照常給分。` },
+    { pts:1, ok: fr>-0.05, label:"資金費率未極端偏負", meaning:"資費 <-0.05%＝空頭過度擁擠、恐慌放空，追空易被連環軋空。", now: fr>-0.05?`資費 ${s(fr,4)}%，高於 -0.05%，空頭未過度擁擠。`:`資費 ${s(fr,4)}% 空頭極端擁擠，易被逼空，不加分。` },
+    { pts:1, ok: fr>0.05, label:"資金費率過熱（誘多環境）", meaning:"資費 >+0.05%＝多頭擁擠付費、市場過熱，是空方燃料。", now: fr>0.05?`資費 ${s(fr,4)}% 超過 +0.05%，多頭過熱，對空方有利。`:`資費 ${s(fr,4)}% 未達過熱，缺乏做空燃料。` },
+    { pts:1, ok: ls>0.8, label:"散戶未擠在空方", meaning:"多空比 <0.8＝散戶大量看空，做空與群眾同側，易被向上掃損。", now: ls>0.8?`多空比 ${ls.toFixed(2)}，高於 0.8，做空不算擁擠。`:`多空比 ${ls.toFixed(2)} 低於 0.8，散戶擠空方，追空風險升高。` },
+    { pts:1, ok: ls>1.5, label:"散戶極度偏多（反向）", meaning:"多空比 >1.5＝散戶追多極端，下方爆倉流動性密集，主力向下收割，短線反而偏空。", now: ls>1.5?`多空比 ${ls.toFixed(2)} 超過 1.5，反向偏空成立。`:`多空比 ${ls.toFixed(2)}，未極端偏多，未觸發。` },
+  ];
+  const sum = (a) => Math.min(10, Math.max(1, a.reduce((x, c) => x + (c.ok ? c.pts : 0), 0)));
+  return { longScore: sum(longChecks), shortScore: sum(shortChecks), longChecks, shortChecks };
+}
+
+// ============================================================ 異常警報判定
+function detectAnomaly(d) {
+  if (!d || d.fundingRate == null) return null;
+  const fr = d.fundingRate * 100, ls = d.lsRatio, tk = d.takerRatio, sm = d.topRatio;
+  const oi = d.oiFastPct != null ? d.oiFastPct : d.oiChangePct, pc = d.priceChangePct;
+  const OIH = 4;
+  const abnormal = Math.abs(oi) >= OIH || Math.abs(fr) >= 0.1 || ls >= 2 || ls <= 0.5 || tk >= 1.3 || tk <= 0.75;
+  if (!abnormal) return null;
+  let pump = 0, dump = 0, tension = 0; const reasons = [];
+  if (oi >= OIH) { tension++; reasons.push(`OI 短線急增 +${oi.toFixed(1)}%（新槓桿大量進場）`); }
+  else if (oi <= -OIH) { reasons.push(`OI 短線急減 ${oi.toFixed(1)}%（快速平倉／清算）`); }
+  if (fr >= 0.1) { dump += 2; reasons.push(`資費極端偏多 +${fr.toFixed(3)}%（多頭擁擠，長軋風險）`); }
+  else if (fr >= 0.05) { dump++; reasons.push(`資費偏多 +${fr.toFixed(3)}%`); }
+  if (fr <= -0.1) { pump += 2; reasons.push(`資費極端偏空 ${fr.toFixed(3)}%（空頭擁擠，軋空燃料）`); }
+  else if (fr <= -0.05) { pump++; reasons.push(`資費偏空 ${fr.toFixed(3)}%`); }
+  if (ls >= 2) { dump++; reasons.push(`散戶極度偏多 ${ls.toFixed(2)}（反向下殺目標）`); }
+  if (ls <= 0.5) { pump++; reasons.push(`散戶極度偏空 ${ls.toFixed(2)}（反向逼空目標）`); }
+  if (tk >= 1.3) { pump++; reasons.push(`主動買盤狂熱 ${tk.toFixed(2)}`); }
+  if (tk <= 0.75) { dump++; reasons.push(`主動賣壓宣洩 ${tk.toFixed(2)}`); }
+  if (!isNaN(sm)) { if (sm >= 1.05 && ls < 0.9) { pump++; reasons.push(`聰明錢偏多、散戶偏空（背離）`); } if (sm <= 0.95 && ls > 1.1) { dump++; reasons.push(`聰明錢偏空、散戶偏多（背離）`); } }
+  if (oi >= OIH && Math.abs(pc) < 1.5) { tension++; reasons.push(`持倉暴增但價格橫盤（壓縮蓄勢，變盤在即）`); }
+  let kind, color;
+  if (pump - dump >= 2) { kind = "爆噴傾向"; color = GREEN; }
+  else if (dump - pump >= 2) { kind = "暴跌傾向"; color = RED; }
+  else if (tension >= 1) { kind = "變盤在即"; color = NEU; }
+  else { kind = "高風險區"; color = NEU; }
+  const sev = Math.min(5, Math.max(pump, dump) + tension + (Math.abs(fr) >= 0.1 ? 1 : 0) + (Math.abs(oi) >= 8 ? 1 : 0));
+  return { kind, color, sev, reasons };
+}
+
+function whaleRead(d) {
+  const p = d.priceChangePct > 1 ? "up" : d.priceChangePct < -1 ? "down" : "flat";
+  const o = d.oiChangePct > 1 ? "up" : d.oiChangePct < -1 ? "down" : "flat";
+  const M = { "up|up":["主力做多／進場建倉","多單帶動上漲，非單純拉抬，趨勢具延續性。"],"up|flat":["現貨推動／換手上漲","主力未明顯跟進，需搭配 CVD 確認能否延續。"],"up|down":["空頭回補為主","軋空行情、非主力布局，不宜追多。"],"flat|up":["低位吸籌／高位派發","主力利用盤整布局，觀察 CVD 與資費偏向。"],"flat|flat":["無共識盤／市場冷感","沒量沒意願，觀望為宜。"],"flat|down":["避險退場／觀望居多","事件前空倉、波動收縮階段。"],"down|up":["主力做空／主動加碼空單","非一般殺多，空方主導明確。"],"down|flat":["現貨砸盤／換手殺跌","未見加倉，疑似誘空，提防反拉。"],"down|down":["多單爆倉／清槓桿","強制平倉主導下跌，屬市場踩踏，提防反彈。"] };
+  return M[`${p}|${o}`];
+}
+const verdict = (x) => x >= 8 ? "適合" : x >= 6 ? "偏可" : x >= 4 ? "中性" : "不宜";
+const fmt = (n, d = 2) => n >= 1000 ? n.toLocaleString("en-US", { maximumFractionDigits: 1 }) : n >= 1 ? n.toFixed(d) : n.toFixed(5);
+const usd = (n) => n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "K" : n.toFixed(0);
+const esc = (s) => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+const pLabel = () => (PERIODS.find(p => p[0] === state.period) || [])[1] || state.period;
+
+async function loadCoins() {
+  state.live = null; render();
+  try {
+    const all = await bfetch(`/fapi/v1/ticker/24hr`);
+    state.coins = all.filter(t => t.symbol.endsWith("USDT") && parseFloat(t.quoteVolume) > 0)
+      .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
+      .map(t => ({ symbol: t.symbol, price: parseFloat(t.lastPrice), changePct: parseFloat(t.priceChangePercent) }));
+    state.live = true;
+  } catch { state.live = false; state.coins = []; }
+  render();
+  if (state.live) ensureScores();
+}
+function changePeriod(p) {
+  if (p === state.period) return;
+  state.period = p;
+  for (const k in cache) delete cache[k];
+  state.alerts = []; state.alertStatus = null;
+  render();
+  if (state.selected) { state.data = null; render(); refreshData(); }
+  else if (state.view === "alerts") scanAlerts();
+  else ensureScores();
+}
+
+function getFiltered() {
+  if (!state.coins) return [];
+  const q = state.query.trim().toUpperCase();
+  let list = q ? state.coins.filter(c => c.symbol.includes(q)) : state.coins.slice();
+  if (state.sort === "long" || state.sort === "short") {
+    const key = state.sort === "long" ? "longScore" : "shortScore";
+    list.sort((a, b) => (cache[b.symbol] ? scoreCoin(cache[b.symbol])[key] : -1) - (cache[a.symbol] ? scoreCoin(cache[a.symbol])[key] : -1));
+  }
+  return list.slice(0, q ? 40 : 30);
+}
+function rankBy(key) { return (state.coins || []).filter(c => cache[c.symbol]).map(c => ({ symbol: c.symbol, sc: scoreCoin(cache[c.symbol])[key] })).sort((a, b) => b.sc - a.sc).slice(0, 5); }
+
+async function ensureScores() {
+  if (!state.live || state.selected || state.view !== "market") return;
+  const targets = getFiltered().filter(c => !cache[c.symbol] && !inflight.has(c.symbol));
+  if (!targets.length) return;
+  await pool(targets, 4, async (coin) => {
+    inflight.add(coin.symbol);
+    try { cache[coin.symbol] = await fetchIndicators(coin.symbol, coin, state.period); patchRow(coin.symbol); throttle("dash", renderDash, 500); if (state.sort !== "vol") throttle("list", renderList, 500); }
+    catch {} finally { inflight.delete(coin.symbol); }
+  });
+}
+function patchRow(symbol) {
+  if (state.selected || state.view !== "market") return; const d = cache[symbol]; if (!d) return; const r = scoreCoin(d);
+  const l = document.getElementById("sl-" + symbol), s = document.getElementById("ss-" + symbol);
+  if (l) { l.textContent = r.longScore; l.style.color = GREEN; } if (s) { s.textContent = r.shortScore; s.style.color = RED; }
+}
+function renderList() { const ul = document.getElementById("coin-list"); if (ul) ul.innerHTML = coinRows(); }
+function renderDash() { const d = document.getElementById("dashboard"); if (d) d.innerHTML = dashInner(); }
+
+// ---------- 異常掃描 ----------
+async function scanAlerts() {
+  if (!state.live) return;
+  state.alertStatus = "scanning"; state.alertProg = 0; renderAlerts();
+  const targets = (state.coins || []).slice(0, 50);
+  const need = targets.filter(c => !cache[c.symbol]);
+  let done = targets.length - need.length;
+  await pool(need, 5, async (coin) => {
+    try { cache[coin.symbol] = await fetchIndicators(coin.symbol, coin, state.period); } catch {}
+    done++; state.alertProg = done; throttle("aprog", () => { const e = document.getElementById("aprog"); if (e) e.textContent = `掃描中 ${done}/${targets.length}`; }, 200);
+  });
+  state.alerts = targets.map(c => ({ coin: c, a: detectAnomaly(cache[c.symbol]) })).filter(x => x.a).sort((a, b) => b.a.sev - a.a.sev);
+  state.alertStatus = "done"; renderAlerts();
+}
+function renderAlerts() { const el = document.getElementById("alerts"); if (el) el.innerHTML = alertsInner(); }
+
+// ---------- 強平 WebSocket ----------
+function subscribeLiq(symbol) {
+  unsubscribeLiq(); state.liq = []; state.liqStatus = "connecting";
+  try {
+    liqWS = new WebSocket(`${WS}/${symbol.toLowerCase()}@forceOrder`);
+    liqWS.onopen = () => { state.liqStatus = "live"; patchLiq(); };
+    liqWS.onmessage = (ev) => { const o = JSON.parse(ev.data).o; if (!o) return; const isLong = o.S === "SELL"; const qty = parseFloat(o.q); const price = parseFloat(o.ap || o.p); state.liq.unshift({ t: o.T || Date.now(), isLong, qty, price, v: qty * price }); state.liq = state.liq.slice(0, 12); patchLiq(); };
+    liqWS.onerror = () => { state.liqStatus = "error"; patchLiq(); };
+    liqWS.onclose = () => { if (state.liqStatus === "connecting") { state.liqStatus = "error"; patchLiq(); } };
+  } catch { state.liqStatus = "error"; }
+}
+function unsubscribeLiq() { if (liqWS) { try { liqWS.close(); } catch {} liqWS = null; } }
+function patchLiq() { const el = document.getElementById("liq"); if (el) el.innerHTML = liqInner(); }
+
+async function refreshData() {
+  const coin = state.coins.find(c => c.symbol === state.selected);
+  try { const d = await fetchIndicators(state.selected, coin, state.period); cache[state.selected] = d; state.data = d; state.updatedAt = Date.now(); if (state.selected) render(); } catch {}
+}
+async function openCoin(symbol) {
+  state.selected = symbol; state.tab = "long"; state.expanded = null;
+  state.data = (cache[symbol] && cache[symbol].period === state.period) ? cache[symbol] : null;
+  if (state.data) state.updatedAt = Date.now();
+  render(); subscribeLiq(symbol);
+  if (!state.data) await refreshData();
+  startAutoRefresh();
+}
+function startAutoRefresh() { stopAutoRefresh(); if (!state.live) return; refreshTimer = setInterval(() => { if (!state.selected) return stopAutoRefresh(); refreshData(); }, 60000); }
+function stopAutoRefresh() { if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; } }
+function back() { state.selected = null; state.data = null; stopAutoRefresh(); unsubscribeLiq(); render(); if (state.view === "market") ensureScores(); }
+function switchView(v) { state.view = v; render(); if (v === "alerts" && state.alertStatus === null) scanAlerts(); if (v === "market") ensureScores(); }
+
+// ============================================================ 畫面
+function header() {
+  const dot = state.live ? GREEN : state.live === null ? "#a3a3a3" : RED;
+  const txt = state.live === null ? "連線幣安中⋯" : state.live ? "幣安 USDT 永續 · 即時數據" : "無法連線幣安 API";
+  return `<header class="px-4 pt-7 pb-4 border-b border-neutral-800 sticky top-0 bg-black z-20">
+    <div class="text-xl font-bold tracking-[0.18em] text-white leading-tight">HUMBLE TRADER<span class="block">ACADEMY</span></div>
+    <div class="text-[13px] text-neutral-400 mt-1.5 tracking-widest">永續合約數據網站</div>
+    <div class="flex items-center gap-2 mt-2"><span class="w-1.5 h-1.5 rounded-full" style="background:${dot}"></span><span class="text-[11px] text-neutral-500">${txt}</span>${state.live === false ? `<button data-action="retry" class="text-[11px] underline text-neutral-400 ml-1">重試</button>` : ""}</div>
+  </header>`;
+}
+function periodBar() {
+  return `<div class="flex items-center gap-2 mb-3"><span class="text-[10px] tracking-widest text-neutral-600">時間框架</span><div class="flex border border-neutral-800 flex-1">${PERIODS.map(([k, l]) => `<button data-action="period" data-p="${k}" class="flex-1 py-1.5 text-[12px] tracking-wider ${state.period === k ? "bg-white text-black font-semibold" : "text-neutral-500"}">${l}</button>`).join("")}</div></div>`;
+}
+function viewNav() {
+  const btn = (v, l) => `<button data-action="view" data-v="${v}" class="flex-1 py-2.5 text-[13px] tracking-widest ${state.view === v ? "text-white border-b-2 border-white font-semibold" : "text-neutral-600 border-b-2 border-transparent"}">${l}</button>`;
+  return `<div class="flex mb-4">${btn("market", "行情評分")}${btn("alerts", "異常警報")}</div>`;
+}
+
+function dashInner() {
+  if (!state.live) return "";
+  const scored = (state.coins || []).filter(c => cache[c.symbol]).length;
+  if (!scored) return `<div class="border border-neutral-800 p-3 text-center text-[12px] text-neutral-600">評分排行計算中⋯</div>`;
+  const col = (title, arr, color) => `<div class="flex-1"><div class="text-[10px] tracking-widest text-neutral-500 mb-1.5">${title}</div>${arr.map((x, i) => `<button data-action="open" data-symbol="${x.symbol}" class="w-full flex items-center justify-between py-1.5 active:opacity-60"><span class="text-[13px] text-neutral-300"><span class="text-neutral-600 mono text-[11px] mr-1.5">${i + 1}</span>${x.symbol.replace("USDT", "")}</span><span class="mono text-sm font-semibold" style="color:${color}">${x.sc}</span></button>`).join("") || `<div class="text-[11px] text-neutral-600 py-1.5">—</div>`}</div>`;
+  return `<div class="border border-neutral-800 p-3"><div class="flex items-center justify-between mb-1"><span class="text-[11px] tracking-widest text-neutral-400">評分排行 · 熱門標的</span><span class="text-[10px] text-neutral-600">已評分 ${scored} 檔</span></div><div class="flex gap-4">${col("做多 Top 5", rankBy("longScore"), GREEN)}<div class="w-px bg-neutral-800"></div>${col("做空 Top 5", rankBy("shortScore"), RED)}</div></div>`;
+}
+
+function coinRows() {
+  const list = getFiltered();
+  if (state.coins && list.length === 0) return `<li class="text-center text-neutral-600 text-sm py-8">找不到符合的幣種，換個關鍵字試試</li>`;
+  return list.map(c => {
+    const sc = cache[c.symbol] ? scoreCoin(cache[c.symbol]) : null; const ch = c.changePct >= 0 ? GREEN : RED;
+    return `<li class="border-b border-neutral-900"><button data-action="open" data-symbol="${c.symbol}" class="w-full flex items-center justify-between py-3.5 active:bg-neutral-900"><div class="text-left"><div class="text-white font-semibold text-sm">${c.symbol.replace("USDT", "")}<span class="text-neutral-600 font-normal text-[11px] ml-1">永續</span></div><div class="mono text-[12px] mt-0.5"><span class="text-neutral-300">${fmt(c.price)}</span><span class="ml-2" style="color:${ch}">${c.changePct >= 0 ? "+" : ""}${c.changePct.toFixed(2)}%</span><span class="text-neutral-600 ml-1 text-[10px]">24h</span></div></div><div class="flex items-center gap-1"><div class="flex flex-col items-center w-11"><span class="text-[9px] tracking-widest text-neutral-500">多</span><span id="sl-${c.symbol}" class="text-base mono font-semibold mt-0.5" style="color:${sc ? GREEN : "#404040"}">${sc ? sc.longScore : "··"}</span></div><div class="w-px h-7 bg-neutral-800"></div><div class="flex flex-col items-center w-11"><span class="text-[9px] tracking-widest text-neutral-500">空</span><span id="ss-${c.symbol}" class="text-base mono font-semibold mt-0.5" style="color:${sc ? RED : "#404040"}">${sc ? sc.shortScore : "··"}</span></div><span class="text-neutral-700 ml-1">›</span></div></button></li>`;
+  }).join("");
+}
+
+function alertsInner() {
+  if (!state.live) return `<div class="text-center text-neutral-600 text-sm py-10">需連線幣安後才能掃描異常。</div>`;
+  const head = `<div class="flex items-center justify-between mb-3"><span id="aprog" class="text-[11px] text-neutral-500">${state.alertStatus === "scanning" ? `掃描中 ${state.alertProg}/50` : `掃描前 50 大量能幣種 · ${pLabel()}週期`}</span><button data-action="rescan" class="text-[11px] underline text-neutral-400">重新掃描</button></div>`;
+  if (state.alertStatus === "scanning" && !state.alerts.length) return head + `<div class="text-center text-neutral-600 text-sm py-8">偵測持倉異常中⋯</div>`;
+  if (state.alertStatus === "done" && !state.alerts.length) return head + `<div class="border border-neutral-800 p-4 text-center text-[13px] text-neutral-500">目前前 50 大幣種在 ${pLabel()}週期無明顯異常。可切換時間框架再看，或稍後重新掃描。</div>`;
+  const cards = state.alerts.map(({ coin, a }) => {
+    const dots = Array.from({ length: 5 }).map((_, i) => `<span class="w-1.5 h-1.5 rounded-full" style="background:${i < a.sev ? a.color : GREY}"></span>`).join("");
+    return `<button data-action="open" data-symbol="${coin.symbol}" class="w-full text-left border border-neutral-800 p-3 active:bg-neutral-900" style="border-left:3px solid ${a.color}">
+      <div class="flex items-center justify-between"><div class="flex items-center gap-2"><span class="text-white font-semibold text-sm">${coin.symbol.replace("USDT", "")}</span><span class="text-[11px] px-1.5 py-0.5 rounded" style="color:${a.color};border:1px solid ${a.color}">${a.kind}</span></div><div class="flex items-center gap-1">${dots}</div></div>
+      <div class="mono text-[12px] text-neutral-400 mt-1">${fmt(coin.price)} <span style="color:${coin.changePct >= 0 ? GREEN : RED}">${coin.changePct >= 0 ? "+" : ""}${coin.changePct.toFixed(2)}%</span><span class="text-neutral-600 ml-1">24h</span></div>
+      <ul class="mt-2 space-y-1">${a.reasons.map(r => `<li class="text-[12px] text-neutral-300 flex gap-1.5"><span style="color:${a.color}">•</span>${r}</li>`).join("")}</ul>
+    </button>`;
+  }).join("");
+  return head + `<div class="space-y-2">${cards}</div><p class="text-[11px] text-neutral-600 mt-4 leading-relaxed">異常＝OI 短線暴衝、資費極端或多空比極端等狀態觸發。傾向由多空信號加總判斷，僅供關注，非進場訊號；「變盤在即」代表能量壓縮、方向待確認。點卡片看完整數據。</p>`;
+}
+
+function listScreen() {
+  const sortBtn = (k, l) => `<button data-action="sort" data-sort="${k}" class="flex-1 py-2 text-[12px] tracking-wider ${state.sort === k ? "bg-white text-black font-semibold" : "text-neutral-500"}">${l}</button>`;
+  const market = `<section id="dashboard" class="mb-4">${dashInner()}</section>
+    <input id="search" value="${esc(state.query)}" placeholder="搜尋幣種，例如 BTC、SOL⋯" autocomplete="off" class="w-full bg-neutral-900 border border-neutral-700 text-white px-4 py-3 text-sm outline-none focus:border-white placeholder-neutral-600" />
+    <div class="flex border border-neutral-800 mt-3">${sortBtn("vol", "成交量")}${sortBtn("long", "做多分↓")}${sortBtn("short", "做空分↓")}</div>
+    <div class="flex justify-between items-center mt-3 px-1"><span class="text-[10px] tracking-widest text-neutral-600">幣種 / 價格</span><span class="text-[10px] tracking-widest text-neutral-600">做多 · 做空 評分</span></div>
+    ${!state.coins ? `<div class="text-center text-neutral-600 text-sm py-10">載入幣種清單中⋯</div>` : `<ul id="coin-list" class="mt-1">${coinRows()}</ul>`}
+    ${state.live ? `<p class="text-[11px] text-neutral-600 mt-4 leading-relaxed">評分依「${pLabel()}」週期即時計算，全部 USDT 永續皆可搜尋。清單％為 24h 漲跌。</p>` : ""}`;
+  return `${header()}<main class="px-4 py-4">
+    ${state.live === false ? `<div class="mb-3 border border-neutral-700 text-neutral-400 text-[12px] px-3 py-2.5 leading-relaxed">無法連上幣安 API。請確認此頁在一般瀏覽器開啟（非 Claude 預覽）、網路可連幣安，再按「重試」。</div>` : ""}
+    ${viewNav()}${periodBar()}
+    ${state.view === "market" ? market : `<section id="alerts">${alertsInner()}</section>`}
+  </main>`;
+}
+
+function bar(score, color) { let h = ""; for (let i = 0; i < 10; i++) h += `<div class="h-3 flex-1" style="background:${i < score ? color : GREY}"></div>`; return `<div class="flex gap-1">${h}</div>`; }
+function statCard(k, v, sub) { return `<div class="border border-neutral-800 p-3"><div class="text-[10px] tracking-widest text-neutral-500 uppercase">${k}</div><div class="text-lg mono text-white mt-1">${v}</div>${sub ? `<div class="text-[11px] text-neutral-500 mt-0.5">${sub}</div>` : ""}</div>`; }
+
+function liqInner() {
+  const st = state.liqStatus;
+  const head = `<div class="flex items-center justify-between"><span class="text-[10px] tracking-widest text-neutral-500 uppercase">強平熱區（即時）</span><span class="text-[10px]" style="color:${st === "live" ? GREEN : st === "error" ? RED : "#a3a3a3"}">${st === "live" ? "● 串流中" : st === "error" ? "● 無法連線" : "● 連線中"}</span></div>`;
+  if (st === "error") return head + `<p class="text-[12px] text-neutral-600 mt-2 leading-relaxed">無法連線幣安強平串流（可能地區限制或網路阻擋）。其他數據不受影響。</p>`;
+  const tl = state.liq.reduce((a, e) => a + (e.isLong ? e.v : 0), 0), ts = state.liq.reduce((a, e) => a + (e.isLong ? 0 : e.v), 0), tot = tl + ts;
+  const lp = tot ? (tl / tot) * 100 : 50;
+  const tally = `<div class="mt-2.5"><div class="flex justify-between text-[11px] mb-1"><span style="color:${RED}">多單強平 $${usd(tl)}</span><span style="color:${GREEN}">空單強平 $${usd(ts)}</span></div><div class="flex h-2.5 bg-neutral-800 overflow-hidden"><div style="width:${lp}%;background:${RED}"></div><div style="width:${100 - lp}%;background:${GREEN}"></div></div></div>`;
+  const rows = state.liq.length ? state.liq.map(e => `<div class="flex items-center justify-between py-1.5 border-b border-neutral-900 text-[12px]"><span style="color:${e.isLong ? RED : GREEN}">${e.isLong ? "多單強平" : "空單強平"}</span><span class="mono text-neutral-400">${e.qty.toFixed(3)} @ ${fmt(e.price)}</span><span class="mono text-neutral-300">$${usd(e.v)}</span></div>`).join("") : `<p class="text-[12px] text-neutral-600 mt-2">自開啟此頁起尚無強平事件（波動大時才會頻繁出現）。</p>`;
+  return head + tally + `<div class="mt-2">${rows}</div><div class="text-[10px] text-neutral-600 mt-1.5">多單強平＝多頭爆倉、偏空壓力；空單強平＝空頭被軋、偏多動能。累計自開啟此頁起算。</div>`;
+}
+
+function detailScreen() {
+  const sym = state.selected.replace("USDT", ""); const d = state.data;
+  let body = `<div class="text-center text-neutral-600 text-sm py-14">抓取幣安指標中⋯</div>`;
+  if (d && !d.demo) {
+    const r = scoreCoin(d), w = whaleRead(d), accent = state.tab === "long" ? GREEN : RED, an = detectAnomaly(d);
+    const checks = (state.tab === "long" ? r.longChecks : r.shortChecks).map((c, i) => {
+      const open = state.expanded === i;
+      return `<li class="border ${c.ok ? "border-neutral-600" : "border-neutral-900"}"><button data-action="expand" data-idx="${i}" class="w-full text-left p-3"><div class="flex justify-between items-baseline gap-2 ${c.ok ? "" : "opacity-50"}"><span class="text-sm ${c.ok ? "text-white" : "text-neutral-500"}"><span style="${c.ok ? "color:" + accent : ""}">${c.ok ? "✓ " : "✕ "}</span>${c.label}</span><span class="mono text-xs shrink-0" style="color:${c.ok ? accent : "#525252"}">${c.ok ? "+" + c.pts : "0/" + c.pts}</span></div><div class="mt-2 flex gap-2"><span class="w-0.5 shrink-0" style="background:${c.ok ? accent : "#404040"}"></span><p class="text-[12px] leading-relaxed ${c.ok ? "text-neutral-300" : "text-neutral-500"}">${c.now}</p></div>${open ? `<div class="mt-2.5 border-t border-neutral-800 pt-2.5"><div class="text-[10px] tracking-widest text-neutral-500 uppercase mb-1">這個數據在看什麼</div><p class="text-[12px] text-neutral-400 leading-relaxed">${c.meaning}</p></div>` : ""}<div class="text-[10px] text-neutral-600 mt-2">${open ? "收合 ▴" : "指標教學 ▾"}</div></button></li>`;
+    }).join("");
+    const nf = d.nextFunding ? Math.max(0, Math.floor((d.nextFunding - Date.now()) / 60000)) : null;
+    const upd = state.updatedAt ? new Date(state.updatedAt).toLocaleTimeString("zh-Hant", { hour12: false }) : "";
+    const anBanner = an ? `<div class="mt-4 border p-3" style="border-color:${an.color}"><div class="flex items-center gap-2"><span class="text-[11px] px-1.5 py-0.5 rounded" style="color:${an.color};border:1px solid ${an.color}">⚠ ${an.kind}</span><span class="text-[11px] text-neutral-500">異常警報 · ${pLabel()}週期</span></div><ul class="mt-2 space-y-1">${an.reasons.map(x => `<li class="text-[12px] text-neutral-300 flex gap-1.5"><span style="color:${an.color}">•</span>${x}</li>`).join("")}</ul></div>` : "";
+    body = `<div class="flex items-baseline justify-between"><h2 class="text-2xl font-bold text-white">${sym}<span class="text-neutral-600 text-xs font-normal ml-2">USDT 永續</span></h2>
+      <div class="text-right mono"><div class="text-lg text-white">${fmt(d.price)}</div><div class="text-[11px]" style="color:${d.priceChangePct >= 0 ? GREEN : RED}">${pLabel()} ${d.priceChangePct >= 0 ? "+" : ""}${d.priceChangePct.toFixed(2)}%</div><div class="text-[10px] text-neutral-600">24h ${d.chg24h >= 0 ? "+" : ""}${d.chg24h.toFixed(2)}%</div></div></div>
+      ${anBanner}
+      <section class="mt-5 space-y-4">
+        <div class="border border-neutral-800 p-4" style="border-left:3px solid ${GREEN}"><div class="flex items-baseline justify-between mb-2"><span class="text-[11px] tracking-widest text-neutral-500">做多評分 · ${pLabel()}</span><span class="mono text-xl" style="color:${GREEN}">${r.longScore}<span class="text-neutral-600 text-xs">/10</span><span class="text-xs ml-2 text-neutral-300">${verdict(r.longScore)}</span></span></div>${bar(r.longScore, GREEN)}</div>
+        <div class="border border-neutral-800 p-4" style="border-left:3px solid ${RED}"><div class="flex items-baseline justify-between mb-2"><span class="text-[11px] tracking-widest text-neutral-500">做空評分 · ${pLabel()}</span><span class="mono text-xl" style="color:${RED}">${r.shortScore}<span class="text-neutral-600 text-xs">/10</span><span class="text-xs ml-2 text-neutral-300">${verdict(r.shortScore)}</span></span></div>${bar(r.shortScore, RED)}</div>
+      </section>
+      <section class="mt-5 border-l-2 border-white pl-4 py-1"><div class="text-[10px] tracking-widest text-neutral-500 uppercase">主力行為判讀（價格 × OI）</div><div class="text-white font-semibold mt-1">${w[0]}</div><div class="text-[13px] text-neutral-400 mt-0.5 leading-relaxed">${w[1]}</div></section>
+      <section class="mt-5 grid grid-cols-2 gap-2">
+        ${statCard("OI 變化 · " + pLabel(), (d.oiChangePct >= 0 ? "+" : "") + d.oiChangePct.toFixed(2) + "%", `短線 ${d.oiFastPct >= 0 ? "+" : ""}${d.oiFastPct.toFixed(2)}%`)}
+        ${statCard("資金費率", (d.fundingRate * 100).toFixed(4) + "%", nf != null ? `下次結算約 ${nf} 分後` : "正=多頭付費")}
+        ${statCard("散戶多空比", d.lsRatio.toFixed(2), "全體帳戶 Long/Short")}
+        ${statCard("Taker 買賣比", d.takerRatio.toFixed(3), ">1 主動買盤強（CVD）")}
+        ${!isNaN(d.topRatio) ? statCard("大戶持倉多空比", d.topRatio.toFixed(2), d.topRatio > d.lsRatio ? "聰明錢較散戶偏多" : "聰明錢較散戶偏空") : ""}
+      </section>
+      <section class="mt-3 border border-neutral-800 p-3" id="liq">${liqInner()}</section>
+      <section class="mt-5"><div class="flex border border-neutral-800"><button data-action="tab" data-tab="long" class="flex-1 py-2.5 text-sm tracking-widest" style="${state.tab === "long" ? `background:${GREEN};color:#000;font-weight:600` : "color:#737373"}">做多加分項</button><button data-action="tab" data-tab="short" class="flex-1 py-2.5 text-sm tracking-widest" style="${state.tab === "short" ? `background:${RED};color:#000;font-weight:600` : "color:#737373"}">做空加分項</button></div>
+        <div class="text-[11px] text-neutral-500 mt-2 px-1">加權制：趨勢資金同步 +3 ＞ 主動成交／聰明錢方向 +2 ＞ 背離／資費／情緒 各 +1。點任一項展開指標教學。</div>
+        <ul class="mt-2 space-y-2">${checks}</ul></section>
+      <div class="flex items-center justify-between mt-6"><span class="text-[11px] text-neutral-600">最後更新 ${upd} · 每 60 秒自動刷新</span><button data-action="refresh" class="text-[11px] underline text-neutral-400">立即刷新</button></div>
+      <p class="mt-3 text-[11px] text-neutral-600 leading-relaxed">評分整合 OI、資金費率、多空比、Taker 買賣比（CVD 代理）、大戶持倉比與強平數據，依所選時間框架計算，屬輔助判讀、非投資建議。單一指標不可孤立解讀。</p>`;
+  } else if (d && d.demo) { body = `<div class="text-center text-neutral-500 text-sm py-14">此幣資料抓取失敗，請返回重試或檢查網路。</div>`; }
+  return `${header()}<main class="px-4 py-4 pb-12"><button data-action="back" class="text-[12px] tracking-widest text-neutral-500 uppercase mb-4">← 返回</button>${body}</main>`;
+}
+
+function render() {
+  const app = document.getElementById("app");
+  app.innerHTML = state.selected ? detailScreen() : listScreen();
+  if (!state.selected && state.view === "market") {
+    const inp = document.getElementById("search");
+    if (inp) inp.addEventListener("input", (e) => { state.query = e.target.value; renderList(); ensureScores(); });
+  }
+}
+
+document.getElementById("app").addEventListener("click", (e) => {
+  const el = e.target.closest("[data-action]"); if (!el) return; const a = el.dataset.action;
+  if (a === "open") openCoin(el.dataset.symbol);
+  else if (a === "back") back();
+  else if (a === "retry") loadCoins();
+  else if (a === "refresh") refreshData();
+  else if (a === "rescan") scanAlerts();
+  else if (a === "view") switchView(el.dataset.v);
+  else if (a === "period") changePeriod(el.dataset.p);
+  else if (a === "tab") { state.tab = el.dataset.tab; state.expanded = null; render(); }
+  else if (a === "expand") { const i = +el.dataset.idx; state.expanded = state.expanded === i ? null : i; render(); }
+  else if (a === "sort") { state.sort = el.dataset.sort; render(); ensureScores(); }
+});
+
+loadCoins();
+</script>
+</body>
+</html>
