@@ -16,11 +16,38 @@
 // 幣安合約+現貨 API｜雙 CVD（現貨/合約）、吸收 vs 衰竭、組合判讀
 // ============================================================
 const FAPI = "https://fapi.binance.com", SAPI = "https://api.binance.com";
+// ★★★ 社群密碼設定 ★★★
+// 預設密碼：humble2026
+// 更新密碼：用下方鎖定畫面的「管理者：產生新密碼」取得雜湊，貼到這一行取代即可。
+// 更新後，所有人（含已登入者）都必須重新輸入一次新密碼。
+const PASS_HASH = "1cf2edf48ce4da7243735cd5e061d07dc8e012d02f8f8277b2dec1b1420b1d81";
+
 const GREEN = "#4ade80", RED = "#f87171", GREY = "#262626", NEU = "#e5e5e5";
 const PERIODS = [["15m","15分"],["1h","1時"],["4h","4時"]];
 
 const state = { coins:null, query:"", sort:"vol", period:"1h", view:"market", selected:null, data:null, live:null, tab:"long", expanded:null, updatedAt:null, alerts:[], alertStatus:null, alertProg:0, chart:null };
 const cache = {}, inflight = new Set(), thr = {};
+let unlocked = false; try { unlocked = localStorage.getItem("hta_auth") === PASS_HASH; } catch {}
+async function sha256(t){
+  if(!(window.crypto&&crypto.subtle)) throw new Error("no-subtle");
+  const b = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(t));
+  return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join("");
+}
+async function tryUnlock(){
+  const el=document.getElementById("pw"), er=document.getElementById("pwerr"); if(!el) return;
+  const v=(el.value||"").trim(); if(!v){ er.textContent="請輸入密碼"; return; }
+  er.textContent="驗證中⋯";
+  try{ const h=await sha256(v);
+    if(h===PASS_HASH){ try{ localStorage.setItem("hta_auth",h); }catch{} unlocked=true; render(); loadCoins(); }
+    else { er.textContent="密碼錯誤，請再試一次"; el.value=""; }
+  }catch{ er.textContent="此環境不支援加密驗證，請確認網址為 https 開頭"; }
+}
+async function genHash(){
+  const el=document.getElementById("np"), out=document.getElementById("npout"); if(!el) return;
+  const v=(el.value||"").trim(); if(!v){ out.textContent="請先輸入新密碼"; return; }
+  try{ out.textContent = await sha256(v); }catch{ out.textContent="需在 https 網站上才能產生雜湊"; }
+}
+function lockOut(){ try{ localStorage.removeItem("hta_auth"); }catch{} unlocked=false; render(); }
 let watch = []; try { watch = JSON.parse(localStorage.getItem("hta_watch") || "[]"); } catch {}
 function saveWatch(){ try { localStorage.setItem("hta_watch", JSON.stringify(watch)); } catch {} }
 function isWatched(s){ return watch.indexOf(s) >= 0; }
@@ -269,7 +296,7 @@ function header(){ const dot=state.live?GREEN:state.live===null?"#a3a3a3":RED;
   return `<header class="px-4 pt-7 pb-4 border-b border-neutral-800 sticky top-0 bg-black z-20">
     <div class="text-xl font-bold tracking-[0.18em] text-white leading-tight">HUMBLE TRADER<span class="block">ACADEMY</span></div>
     <div class="text-[13px] text-neutral-400 mt-1.5 tracking-widest">永續合約數據網站</div>
-    <div class="flex items-center gap-2 mt-2"><span class="w-1.5 h-1.5 rounded-full" style="background:${dot}"></span><span class="text-[11px] text-neutral-500">${txt}</span>${state.live===false?`<button data-action="retry" class="text-[11px] underline text-neutral-400 ml-1">重試</button>`:""}</div></header>`; }
+    <div class="flex items-center gap-2 mt-2"><span class="w-1.5 h-1.5 rounded-full" style="background:${dot}"></span><span class="text-[11px] text-neutral-500">${txt}</span>${state.live===false?`<button data-action="retry" class="text-[11px] underline text-neutral-400 ml-1">重試</button>`:""}<button data-action="lockout" class="text-[11px] text-neutral-600 underline ml-auto">鎖定</button></div></header>`; }
 function periodBar(){ return `<div class="flex items-center gap-2 mb-3"><span class="text-[10px] tracking-widest text-neutral-600">時間框架</span><div class="flex border border-neutral-800 flex-1">${PERIODS.map(([k,l])=>`<button data-action="period" data-p="${k}" class="flex-1 py-1.5 text-[12px] tracking-wider ${state.period===k?"bg-white text-black font-semibold":"text-neutral-500"}">${l}</button>`).join("")}</div></div>`; }
 function viewNav(){ const b=(v,l)=>`<button data-action="view" data-v="${v}" class="flex-1 py-2.5 text-[13px] tracking-widest ${state.view===v?"text-white border-b-2 border-white font-semibold":"text-neutral-600 border-b-2 border-transparent"}">${l}</button>`;
   return `<div class="flex mb-4">${b("market","行情評分")}${b("watch","觀察清單")}${b("alerts","異常警報")}</div>`; }
@@ -302,7 +329,7 @@ function listScreen(){ const sb=(k,l)=>`<button data-action="sort" data-sort="${
     <div class="flex border border-neutral-800 mt-3">${sb("vol","成交量")}${sb("long","做多分↓")}${sb("short","做空分↓")}</div>
     <div class="flex justify-between items-center mt-3 px-1"><span class="text-[10px] tracking-widest text-neutral-600">幣種 / 價格</span><span class="text-[10px] tracking-widest text-neutral-600">做多 · 做空 評分</span></div>
     ${!state.coins?`<div class="text-center text-neutral-600 text-sm py-10">載入幣種清單中⋯</div>`:`<ul id="coin-list" class="mt-1">${coinRows()}</ul>`}
-    ${state.live?`<p class="text-[11px] text-neutral-600 mt-4 leading-relaxed">評分依「${pLabel()}」週期計算，整合現貨＋合約雙 CVD。全部 USDT 永續皆可搜尋。</p>`:""}`;
+    ${state.live?`<p class="text-[11px] text-neutral-600 mt-4 leading-relaxed">評分依「${pLabel()}」週期計算，整合現貨＋合約雙 CVD。全部 USDT 永續皆可搜尋。</p>`:""}<div class="mt-6 text-center"><button data-action="logout" class="text-[11px] text-neutral-700 underline">登出此裝置</button></div>`;
   return `${header()}<main class="px-4 py-4">${state.live===false?`<div class="mb-3 border border-neutral-700 text-neutral-400 text-[12px] px-3 py-2.5 leading-relaxed">無法連上幣安 API。請確認此頁在一般瀏覽器開啟（非 Claude 預覽），再按「重試」。</div>`:""}${viewNav()}${periodBar()}${state.view==="alerts"?`<section id="alerts">${alertsInner()}</section>`:state.view==="watch"?`<div class="text-[11px] text-neutral-500 mb-2">觀察清單 · ${pLabel()}週期（${watch.length} 檔）</div><ul id="coin-list">${coinRows()}</ul>`:mk}</main>`; }
 function bar(sc,c){ let h=""; for(let i=0;i<15;i++) h+=`<div class="h-3 flex-1" style="background:${i<sc?c:GREY}"></div>`; return `<div class="flex gap-1">${h}</div>`; }
 function statCard(k,v,s){ return `<div class="border border-neutral-800 p-3"><div class="text-[10px] tracking-widest text-neutral-500 uppercase">${k}</div><div class="text-lg mono text-white mt-1">${v}</div>${s?`<div class="text-[11px] text-neutral-500 mt-0.5">${s}</div>`:""}</div>`; }
@@ -348,16 +375,87 @@ function detailScreen(){ const sym=state.selected.replace("USDT",""); const d=st
       <div class="flex items-center justify-between mt-6"><span class="text-[11px] text-neutral-600">最後更新 ${upd} · 每 60 秒自動刷新</span><button data-action="refresh" class="text-[11px] underline text-neutral-400">立即刷新</button></div>
       <p class="mt-3 text-[11px] text-neutral-600 leading-relaxed">整合現貨／合約雙 CVD、OI、資金費率與趨勢、多空比與趨勢、大戶持倉，依所選週期計算，屬輔助判讀、非投資建議。</p>`; }
   return `${header()}<main class="px-4 py-4 pb-12"><button data-action="back" class="text-[12px] tracking-widest text-neutral-500 uppercase mb-4">← 返回</button>${body}</main>`; }
-function render(){ const app=document.getElementById("app"); app.innerHTML=state.selected?detailScreen():listScreen();
+function lockScreen(){
+  return `<div class="min-h-screen flex flex-col justify-center px-6 py-16">
+    <div class="text-2xl font-bold tracking-[0.18em] text-white leading-tight text-center">HUMBLE TRADER<span class="block">ACADEMY</span></div>
+    <div class="text-[13px] text-neutral-400 mt-2 tracking-widest text-center">永續合約數據網站</div>
+    <div class="mt-10 border border-neutral-800 p-5">
+      <div class="text-[11px] tracking-widest text-neutral-500 uppercase mb-3">社群成員專用 · 請輸入密碼</div>
+      <input id="pw" type="password" inputmode="text" autocomplete="current-password" placeholder="輸入密碼" class="w-full bg-neutral-900 border border-neutral-700 text-white px-4 py-3 text-sm outline-none focus:border-white placeholder-neutral-600" />
+      <button data-action="unlock" class="w-full mt-3 py-3 bg-white text-black text-sm font-semibold tracking-widest active:opacity-70">解 鎖</button>
+      <div id="pwerr" class="text-[12px] mt-2 min-h-[18px]" style="color:${RED}"></div>
+      <p class="text-[11px] text-neutral-600 leading-relaxed">驗證成功後此裝置會記住，不需重複輸入；管理者更新密碼後需再輸入一次。</p>
+    </div>
+    <button data-action="showgen" class="text-[11px] text-neutral-700 mt-6 underline text-center">管理者：產生新密碼</button>
+    <div id="genbox" class="hidden mt-3 border border-neutral-800 p-4">
+      <div class="text-[11px] text-neutral-500 mb-2">輸入想設定的新密碼，取得雜湊後貼回 index.html 的 PASS_HASH 那一行，重新部署即可。</div>
+      <input id="np" type="text" placeholder="新密碼" class="w-full bg-neutral-900 border border-neutral-700 text-white px-3 py-2 text-sm outline-none focus:border-white placeholder-neutral-600" />
+      <button data-action="genhash" class="w-full mt-2 py-2 border border-neutral-600 text-neutral-200 text-[12px] tracking-widest active:opacity-70">產生雜湊</button>
+      <div id="npout" class="mono text-[11px] text-neutral-300 mt-2 break-all select-all"></div>
+    </div>
+  </div>`; }
+function render(){ const app=document.getElementById("app");
+  if(!unlocked){ app.innerHTML=lockScreen();
+    const i=document.getElementById("pw"); if(i){ i.addEventListener("keydown",e=>{ if(e.key==="Enter") tryUnlock(); }); setTimeout(()=>i.focus(),50); }
+    return; }
+  app.innerHTML=state.selected?detailScreen():listScreen();
   if(!state.selected&&state.view==="market"){ const i=document.getElementById("search"); if(i) i.addEventListener("input",e=>{ state.query=e.target.value; renderList(); ensureScores(); }); } }
 document.getElementById("app").addEventListener("click",e=>{ const el=e.target.closest("[data-action]"); if(!el) return; const a=el.dataset.action;
-  if(a==="star"){ toggleWatch(el.dataset.symbol); render(); if(!state.selected) ensureScores(); }
+  if(a==="logout"){ logout(); }
+  else if(a==="unlock") tryUnlock();
+  else if(a==="genhash") genHash();
+  else if(a==="showgen"){ const g=document.getElementById("genbox"); if(g) g.classList.toggle("hidden"); }
+  else if(a==="lockout") lockOut();
+  else if(a==="star"){ toggleWatch(el.dataset.symbol); render(); if(!state.selected) ensureScores(); }
   else if(a==="open") openCoin(el.dataset.symbol); else if(a==="back") back(); else if(a==="retry") loadCoins();
   else if(a==="refresh") refreshData(); else if(a==="rescan") scanAlerts(); else if(a==="view") switchView(el.dataset.v);
   else if(a==="period") changePeriod(el.dataset.p); else if(a==="tab"){ state.tab=el.dataset.tab; state.expanded=null; render(); }
   else if(a==="expand"){ const i=+el.dataset.idx; state.expanded=state.expanded===i?null:i; render(); }
   else if(a==="sort"){ state.sort=el.dataset.sort; render(); ensureScores(); } });
-loadCoins();
+// ============================================================
+// 存取密碼設定（社群門檻）
+//   換密碼步驟：1) 到 網址?hash 產生新雜湊 2) 貼到 hash 3) version +1
+//   version 一改，所有人下次開啟都必須重新輸入密碼。
+//   注意：純前端驗證僅為門檻，非真正加密，請勿當作機密保護。
+// ============================================================
+const AUTH = { version: 1, hash: "02ffb8846c979b96", hint: "請向 Humble Trader Academy 管理員索取" };
+function hashPw(s){ let h1=0x811c9dc5>>>0, h2=0x01000193>>>0;
+  for(let i=0;i<s.length;i++){ const c=s.charCodeAt(i); h1=Math.imul(h1^c,16777619)>>>0; h2=Math.imul((h2+c)^(h1>>>7),2246822519)>>>0; }
+  return (h1>>>0).toString(16).padStart(8,"0")+(h2>>>0).toString(16).padStart(8,"0"); }
+function authed(){ try{ return localStorage.getItem("hta_key")===AUTH.version+":"+AUTH.hash; }catch{ return false; } }
+function setAuthed(){ try{ localStorage.setItem("hta_key",AUTH.version+":"+AUTH.hash); }catch{} }
+function logout(){ try{ localStorage.removeItem("hta_key"); }catch{} location.reload(); }
+function lockScreen(err){
+  return `<div class="min-h-screen flex flex-col justify-center px-6">
+    <div class="text-xl font-bold tracking-[0.18em] text-white leading-tight text-center">HUMBLE TRADER<span class="block">ACADEMY</span></div>
+    <div class="text-[13px] text-neutral-400 mt-2 tracking-widest text-center">永續合約數據網站</div>
+    <div class="mt-8 border border-neutral-800 p-5">
+      <div class="text-[11px] tracking-widest text-neutral-500 uppercase mb-3">社群成員專用 · 請輸入密碼</div>
+      <input id="pw" type="password" inputmode="text" autocomplete="off" placeholder="輸入通行密碼"
+        class="w-full bg-neutral-900 border border-neutral-700 text-white px-4 py-3 text-sm outline-none focus:border-white placeholder-neutral-600" />
+      ${err?`<div class="text-[12px] mt-2" style="color:${RED}">${err}</div>`:""}
+      <button id="pwgo" class="w-full mt-3 py-3 bg-white text-black text-sm font-semibold tracking-widest">進 入</button>
+      <div class="text-[11px] text-neutral-600 mt-3 leading-relaxed">通過後此裝置會記住，之後開啟免再輸入；管理員更新密碼時需重新輸入。${AUTH.hint}</div>
+    </div></div>`; }
+function renderLock(err){
+  const app=document.getElementById("app"); app.innerHTML=lockScreen(err);
+  const go=()=>{ const v=(document.getElementById("pw").value||"").trim();
+    if(hashPw(v)===AUTH.hash){ setAuthed(); boot(); } else renderLock("密碼錯誤，請再試一次"); };
+  document.getElementById("pwgo").addEventListener("click",go);
+  document.getElementById("pw").addEventListener("keydown",e=>{ if(e.key==="Enter") go(); });
+  document.getElementById("pw").focus(); }
+function renderHashTool(){
+  const app=document.getElementById("app");
+  app.innerHTML=`<div class="min-h-screen px-6 py-10"><div class="text-[11px] tracking-widest text-neutral-500 uppercase mb-3">管理工具 · 產生密碼雜湊</div>
+    <input id="np" placeholder="輸入新密碼" class="w-full bg-neutral-900 border border-neutral-700 text-white px-4 py-3 text-sm outline-none focus:border-white placeholder-neutral-600" />
+    <button id="ng" class="w-full mt-3 py-3 bg-white text-black text-sm font-semibold tracking-widest">產生雜湊</button>
+    <div id="nr" class="mt-4 text-[13px] mono text-white break-all"></div>
+    <p class="text-[11px] text-neutral-600 mt-4 leading-relaxed">把產生的雜湊貼到程式碼中 AUTH.hash，並將 AUTH.version 加 1，重新部署即可更新密碼；所有人下次開啟都需重新輸入。</p></div>`;
+  document.getElementById("ng").addEventListener("click",()=>{
+    const v=(document.getElementById("np").value||"").trim();
+    document.getElementById("nr").innerHTML = v? `hash: "${hashPw(v)}"` : "請先輸入密碼"; }); }
+function boot(){ if(location.search.indexOf("hash")>=0) return renderHashTool(); if(!authed()) return renderLock(); loadCoins(); }
+boot();
 </script>
 </body>
 </html>
