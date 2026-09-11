@@ -365,7 +365,7 @@ document.getElementById("app").addEventListener("click",e=>{ const el=e.target.c
 //   version 一改，所有人下次開啟都必須重新輸入密碼。
 //   注意：純前端驗證僅為門檻，非真正加密，請勿當作機密保護。
 // ============================================================
-const AUTH = { version: 1, hash: "02ffb8846c979b96", hint: "請向 Humble Trader Academy 管理員索取" };
+const AUTH = { version: 2, hash: "42610e8b4098aa4b", hint: "請向 Humble Trader Academy 管理員索取" };
 function hashPw(s){ let h1=0x811c9dc5>>>0, h2=0x01000193>>>0;
   for(let i=0;i<s.length;i++){ const c=s.charCodeAt(i); h1=Math.imul(h1^c,16777619)>>>0; h2=Math.imul((h2+c)^(h1>>>7),2246822519)>>>0; }
   return (h1>>>0).toString(16).padStart(8,"0")+(h2>>>0).toString(16).padStart(8,"0"); }
